@@ -3,5 +3,5 @@
     <include file="$(find HPHS)/launch/cmu_framework.launch"/>
     <include file="$(find HPHS)/launch/octomap_server.launch"/>
     <include file="$(find HPHS)/launch/move_base.launch"/>
-
+<include file="$(find HPHS)/launch/run.launch"/>
 </launch>

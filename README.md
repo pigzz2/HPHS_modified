@@ -67,15 +67,17 @@ catkin_make
 ```bash
 cd ${YOUR_WORKSPACE_PATH}/src
 git clone https://github.com/bit-lsj/HPHS.git
+
+source /opt/ros/noetic/setup.bash
+source ~/code_station/Exploration/autonomous_exploration_development_environment/devel/setup.bash
+catkin_make
 ```
 
 ### 4. Run HPHS
 
 (1) Open a new terminal and start the simulation environment:
 ```bash
-cd autonomous_exploration_development_environment
-source ./devel/setup.sh
-source ~/${YOUR_WORKSPACE_PATH}/devel/setup.bash
+source ~/code_station/Exploration/my_planner/hphs_m/devel/setup.bash
 roslaunch HPHS exploration.launch
 ```
 

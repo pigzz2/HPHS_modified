@@ -1,0 +1,4 @@
+<launch>
+    <env name="PYTHONPATH" value="$(find HPHS)/scripts:$(env PYTHONPATH)" />
+    <node pkg="HPHS" type="explorer.py"  name="explorer" output="screen" />
+</launch>

@@ -20,9 +20,6 @@ include_directories(
 )
 
 catkin_install_python(PROGRAMS
-  scripts/dtw.py
-  scripts/utils.py
-  scripts/explorer.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

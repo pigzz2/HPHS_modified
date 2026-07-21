@@ -24,6 +24,7 @@ class SWPManager:
         self.publish_seed_cells = rospy.get_param("~swp/publish_seed_cells", True)
         self.seed_z = float(rospy.get_param("~swp/seed_z", 0.35))
         self.seed_alpha = float(rospy.get_param("~swp/seed_alpha", 1.0))
+        self.marker_id_min_overlap_ratio = float(rospy.get_param("~swp/marker_id_min_overlap_ratio", 0.2))
         self.scope = rospy.get_param("~swp/scope", "all_subregions")
         self.debug = rospy.get_param("~swp/debug", True)
 
@@ -40,6 +41,8 @@ class SWPManager:
         self.last_seed_signature = None
         self.last_region_signature = None
         self.last_wpb_signature = None
+        self.region_marker_tracks = {}
+        self.next_region_marker_id = 0
 
         self.map_sub = rospy.Subscriber("/map", OccupancyGrid, self.map_callback, queue_size=1)
         self.region_pub = rospy.Publisher("/swp_regions", MarkerArray, queue_size=1)
@@ -321,22 +324,25 @@ class SWPManager:
         publish_stats = result.setdefault("publish_stats", {})
 
         current_region_ids = set()
+        region_marker_ids, region_marker_stats = self._assign_region_marker_ids(result["regions"])
+        publish_stats.update(region_marker_stats)
         for label_id in sorted(result["regions"].keys()):
             cells = result["regions"][label_id]
             if not cells:
                 continue
+            marker_id = region_marker_ids[label_id]
             marker = self._make_cube_list_marker(
                 frame_id=map_msg.header.frame_id or "map",
                 stamp=stamp,
                 ns="swp_regions",
-                marker_id=label_id,
+                marker_id=marker_id,
                 resolution=map_msg.info.resolution,
                 z=self.region_z,
-                color=self._region_color(label_id),
+                color=self._region_color(marker_id),
             )
             marker.points = [self._cell_to_point(map_msg, cell, self.region_z) for cell in cells]
             region_array.markers.append(marker)
-            current_region_ids.add(label_id)
+            current_region_ids.add(marker_id)
 
         components = self._connected_components(result["wpb_cells"])
         current_wpb_ids = set()
@@ -669,6 +675,62 @@ class SWPManager:
         self.last_region_marker_ids = set()
         self.last_wpb_marker_ids = set()
         self.last_seed_marker_ids = set()
+        self.region_marker_tracks = {}
+        self.next_region_marker_id = 0
+
+    def _assign_region_marker_ids(self, regions):
+        region_cells = {
+            label_id: set(cells)
+            for label_id, cells in regions.items()
+            if cells
+        }
+        label_to_marker_id = {}
+        used_marker_ids = set()
+        reused = 0
+        created = 0
+
+        candidates = []
+        for label_id, cells in region_cells.items():
+            if not cells:
+                continue
+            for marker_id, previous_cells in self.region_marker_tracks.items():
+                overlap = len(cells & previous_cells)
+                if overlap == 0:
+                    continue
+                overlap_ratio = float(overlap) / float(len(cells))
+                candidates.append((overlap_ratio, overlap, label_id, marker_id))
+
+        candidates.sort(reverse=True)
+        assigned_labels = set()
+        for overlap_ratio, _overlap, label_id, marker_id in candidates:
+            if overlap_ratio < self.marker_id_min_overlap_ratio:
+                continue
+            if label_id in assigned_labels or marker_id in used_marker_ids:
+                continue
+            label_to_marker_id[label_id] = marker_id
+            assigned_labels.add(label_id)
+            used_marker_ids.add(marker_id)
+            reused += 1
+
+        for label_id in sorted(region_cells.keys()):
+            if label_id in label_to_marker_id:
+                continue
+            marker_id = self.next_region_marker_id
+            self.next_region_marker_id += 1
+            label_to_marker_id[label_id] = marker_id
+            used_marker_ids.add(marker_id)
+            created += 1
+
+        self.region_marker_tracks = {
+            label_to_marker_id[label_id]: cells
+            for label_id, cells in region_cells.items()
+        }
+
+        return label_to_marker_id, {
+            "region_marker_reused": reused,
+            "region_marker_new": created,
+            "region_marker_tracks": len(self.region_marker_tracks),
+        }
 
     def _delete_stale_markers(self, publisher, namespace, current_ids, last_ids):
         stale_ids = last_ids - current_ids
@@ -794,7 +856,7 @@ class SWPManager:
         region_cells = sum(len(cells) for cells in result["regions"].values())
         rospy.loginfo_throttle(
             2.0,
-            "SWP mode=%s selected_subregion=%s frontiers=%d selected_frontiers=%d clusters=%d/%d dropped=%d active_subregions=%d seeds=%d seed_marker_points=%d seed_marker_count=%d seed_publish_enabled=%s seed_changed=%s source_changed=%s region_changed=%s wpb_changed=%s seed_fallback_used=%d max_seed_distance=%d regions=%d region_cells=%d wpb_cells=%d cluster_seed_counts=%s subregions=%s seed_failures=%s",
+            "SWP mode=%s selected_subregion=%s frontiers=%d selected_frontiers=%d clusters=%d/%d dropped=%d active_subregions=%d seeds=%d seed_marker_points=%d seed_marker_count=%d seed_publish_enabled=%s seed_changed=%s source_changed=%s region_changed=%s wpb_changed=%s region_marker_reused=%d region_marker_new=%d region_marker_tracks=%d seed_fallback_used=%d max_seed_distance=%d regions=%d region_cells=%d wpb_cells=%d cluster_seed_counts=%s subregions=%s seed_failures=%s",
             stats.get("mode", self.scope),
             context["selected_subregion"],
             stats.get("frontiers", 0),
@@ -811,6 +873,9 @@ class SWPManager:
             publish_stats.get("source_changed", False),
             publish_stats.get("region_changed", False),
             publish_stats.get("wpb_changed", False),
+            publish_stats.get("region_marker_reused", 0),
+            publish_stats.get("region_marker_new", 0),
+            publish_stats.get("region_marker_tracks", 0),
             seed_failures.get("seed_fallback_used", 0),
             seed_failures.get("max_seed_distance", 0),
             len(result["regions"]),

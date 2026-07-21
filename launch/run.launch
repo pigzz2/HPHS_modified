@@ -2,6 +2,7 @@
     <env name="PYTHONPATH" value="$(find HPHS)/scripts:$(env PYTHONPATH)" />
     <node pkg="HPHS" type="explorer.py"  name="explorer" output="screen">
         <param name="swp/enabled" value="true" />
+        <param name="swp/scope" value="all_subregions" />
         <param name="swp/update_rate" value="10.0" />
         <param name="swp/region_z" value="0.15" />
         <param name="swp/wpb_z" value="0.25" />

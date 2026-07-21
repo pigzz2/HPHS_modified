@@ -20,6 +20,7 @@ class SWPManager:
         self.wpb_alpha = float(rospy.get_param("~swp/wpb_alpha", 0.9))
         self.min_cluster_size = int(rospy.get_param("~swp/min_cluster_size", 1))
         self.seed_search_radius_cells = int(rospy.get_param("~swp/seed_search_radius_cells", 2))
+        self.scope = rospy.get_param("~swp/scope", "all_subregions")
         self.debug = rospy.get_param("~swp/debug", True)
 
         self.lock = threading.Lock()
@@ -28,6 +29,8 @@ class SWPManager:
         self.last_context_key = None
         self.last_region_marker_count = 0
         self.last_wpb_marker_count = 0
+        self.last_region_marker_ids = set()
+        self.last_wpb_marker_ids = set()
 
         self.map_sub = rospy.Subscriber("/map", OccupancyGrid, self.map_callback, queue_size=1)
         self.region_pub = rospy.Publisher("/swp_regions", MarkerArray, queue_size=1)
@@ -41,15 +44,19 @@ class SWPManager:
             self.map_msg = msg
 
     def set_context(self, selected_subregion, subregion_center, map_origin_resized,
-                    map_size_resized, n_w, n_h, frontiers, frontier_cluster_dist):
+                    map_size_resized, n_w, n_h, frontiers, frontier_cluster_dist,
+                    subregion_centers=None, active_subregions=None, selected_frontiers=None):
         context = {
             "selected_subregion": selected_subregion,
             "subregion_center": list(subregion_center),
+            "subregion_centers": [list(center) for center in subregion_centers] if subregion_centers is not None else [list(subregion_center)],
+            "active_subregions": list(active_subregions) if active_subregions is not None else [selected_subregion],
             "map_origin_resized": list(map_origin_resized),
             "map_size_resized": list(map_size_resized),
             "n_w": int(n_w),
             "n_h": int(n_h),
             "frontiers": [self._frontier_to_xy(frontier) for frontier in frontiers],
+            "selected_frontiers": [self._frontier_to_xy(frontier) for frontier in selected_frontiers] if selected_frontiers is not None else [],
             "frontier_cluster_dist": float(frontier_cluster_dist),
         }
         with self.lock:
@@ -76,13 +83,26 @@ class SWPManager:
                 self.last_context_key = None
             return
 
-        context_key = (
-            context["selected_subregion"],
-            context["n_w"],
-            context["n_h"],
-            round(context["subregion_center"][0], 3),
-            round(context["subregion_center"][1], 3),
-        )
+        if self.scope == "all_subregions":
+            context_key = (
+                self.scope,
+                context["n_w"],
+                context["n_h"],
+                round(context["map_origin_resized"][0], 3),
+                round(context["map_origin_resized"][1], 3),
+                round(context["map_size_resized"][0], 3),
+                round(context["map_size_resized"][1], 3),
+                tuple(sorted(context["active_subregions"])),
+            )
+        else:
+            context_key = (
+                self.scope,
+                context["selected_subregion"],
+                context["n_w"],
+                context["n_h"],
+                round(context["subregion_center"][0], 3),
+                round(context["subregion_center"][1], 3),
+            )
         if context_key != self.last_context_key:
             self._clear_markers()
             self.last_context_key = context_key
@@ -92,8 +112,13 @@ class SWPManager:
         self.publish_result(map_msg, result)
 
     def updateSWP(self, map_msg, context):
+        if self.scope == "all_subregions":
+            return self._update_all_subregions(map_msg, context)
+        return self._update_selected_subregion(map_msg, context)
+
+    def _update_selected_subregion(self, map_msg, context):
         raw_clusters = self._cluster_frontiers(
-            context["frontiers"],
+            context["selected_frontiers"] if context["selected_frontiers"] else context["frontiers"],
             context["frontier_cluster_dist"],
         )
         clusters = [cluster for cluster in raw_clusters if len(cluster) >= self.min_cluster_size]
@@ -101,21 +126,96 @@ class SWPManager:
         seed_stats = self._empty_seed_stats()
 
         if len(clusters) == 0:
-            return {
-                "regions": {},
-                "wpb_cells": set(),
-                "wpb_adjacent_labels": {},
-                "stats": {
-                    "frontiers": len(context["frontiers"]),
-                    "raw_clusters": len(raw_clusters),
-                    "valid_clusters": 0,
-                    "seed_cells": 0,
-                    "seed_failures": seed_stats,
-                    "cluster_seed_counts": [],
-                },
-            }
+            return self._empty_result(context, raw_clusters, seed_stats, mode="selected_subregion")
 
         bounds = self._subregion_bounds(map_msg, context)
+        result = self._propagate_clusters(map_msg, clusters, bounds, seed_stats, label_offset=0)
+        result["stats"].update({
+            "mode": "selected_subregion",
+            "frontiers": len(context["selected_frontiers"] if context["selected_frontiers"] else context["frontiers"]),
+            "total_frontiers": len(context["frontiers"]),
+            "raw_clusters": len(raw_clusters),
+            "valid_clusters": len(clusters),
+            "active_subregions": 1,
+        })
+        return result
+
+    def _update_all_subregions(self, map_msg, context):
+        raw_clusters = self._cluster_frontiers(
+            context["frontiers"],
+            context["frontier_cluster_dist"],
+        )
+        clusters = [cluster for cluster in raw_clusters if len(cluster) >= self.min_cluster_size]
+        seed_stats = self._empty_seed_stats()
+
+        if len(clusters) == 0:
+            return self._empty_result(context, raw_clusters, seed_stats, mode="all_subregions")
+
+        clusters_by_subregion = defaultdict(list)
+        dropped_clusters = 0
+        for cluster in clusters:
+            subregion_idx = self._cluster_subregion(cluster, context)
+            if subregion_idx is None:
+                dropped_clusters += 1
+                continue
+            clusters_by_subregion[subregion_idx].append(cluster)
+
+        merged_regions = {}
+        merged_wpb_cells = set()
+        merged_wpb_adjacent_labels = defaultdict(set)
+        merged_cluster_seed_counts = []
+        subregion_summaries = []
+        label_offset = 0
+
+        for subregion_idx in sorted(clusters_by_subregion.keys()):
+            bounds = self._subregion_bounds_for_index(map_msg, context, subregion_idx)
+            subregion_clusters = clusters_by_subregion[subregion_idx]
+            result = self._propagate_clusters(
+                map_msg,
+                subregion_clusters,
+                bounds,
+                seed_stats,
+                label_offset=label_offset,
+            )
+            merged_regions.update(result["regions"])
+            merged_wpb_cells.update(result["wpb_cells"])
+            for cell, labels in result["wpb_adjacent_labels"].items():
+                merged_wpb_adjacent_labels[cell].update(labels)
+            merged_cluster_seed_counts.extend(result["stats"]["cluster_seed_counts"])
+            subregion_summaries.append(
+                "%s:c%d/s%d/r%d/w%d" % (
+                    subregion_idx,
+                    len(subregion_clusters),
+                    result["stats"]["seed_cells"],
+                    len(result["regions"]),
+                    len(result["wpb_cells"]),
+                )
+            )
+            label_offset += len(subregion_clusters)
+
+        region_cells = sum(len(cells) for cells in merged_regions.values())
+        return {
+            "regions": merged_regions,
+            "wpb_cells": merged_wpb_cells,
+            "wpb_adjacent_labels": dict(merged_wpb_adjacent_labels),
+            "stats": {
+                "mode": "all_subregions",
+                "frontiers": len(context["frontiers"]),
+                "total_frontiers": len(context["frontiers"]),
+                "selected_frontiers": len(context["selected_frontiers"]),
+                "raw_clusters": len(raw_clusters),
+                "valid_clusters": len(clusters),
+                "dropped_clusters": dropped_clusters,
+                "active_subregions": len(clusters_by_subregion),
+                "seed_cells": sum(merged_cluster_seed_counts),
+                "seed_failures": seed_stats,
+                "cluster_seed_counts": merged_cluster_seed_counts,
+                "subregion_summaries": subregion_summaries,
+                "region_cells": region_cells,
+            },
+        }
+
+    def _propagate_clusters(self, map_msg, clusters, bounds, seed_stats, label_offset):
         labels = {}
         wpb_cells = set()
         wpb_adjacent_labels = defaultdict(set)
@@ -123,7 +223,8 @@ class SWPManager:
         seed_count = 0
         cluster_seed_counts = []
 
-        for label_id, cluster in enumerate(clusters):
+        for local_label_id, cluster in enumerate(clusters):
+            label_id = label_offset + local_label_id
             seeds = self._cluster_seed_cells(map_msg, cluster, bounds, seed_stats)
             seed_count += len(seeds)
             cluster_seed_counts.append(len(seeds))
@@ -187,9 +288,6 @@ class SWPManager:
             "wpb_cells": wpb_cells,
             "wpb_adjacent_labels": dict(wpb_adjacent_labels),
             "stats": {
-                "frontiers": len(context["frontiers"]),
-                "raw_clusters": len(raw_clusters),
-                "valid_clusters": len(clusters),
                 "seed_cells": seed_count,
                 "seed_failures": seed_stats,
                 "cluster_seed_counts": cluster_seed_counts,
@@ -201,7 +299,7 @@ class SWPManager:
         region_array = MarkerArray()
         wpb_array = MarkerArray()
 
-        region_count = 0
+        current_region_ids = set()
         for label_id in sorted(result["regions"].keys()):
             cells = result["regions"][label_id]
             if not cells:
@@ -217,9 +315,10 @@ class SWPManager:
             )
             marker.points = [self._cell_to_point(map_msg, cell, self.region_z) for cell in cells]
             region_array.markers.append(marker)
-            region_count += 1
+            current_region_ids.add(label_id)
 
         components = self._connected_components(result["wpb_cells"])
+        current_wpb_ids = set()
         for marker_id, component in enumerate(components):
             marker = self._make_cube_list_marker(
                 frame_id=map_msg.header.frame_id or "map",
@@ -232,13 +331,16 @@ class SWPManager:
             )
             marker.points = [self._cell_to_point(map_msg, cell, self.wpb_z) for cell in component]
             wpb_array.markers.append(marker)
+            current_wpb_ids.add(marker_id)
 
         self.region_pub.publish(region_array)
         self.wpb_pub.publish(wpb_array)
-        self._delete_stale_markers(self.region_pub, "swp_regions", region_count, self.last_region_marker_count)
-        self._delete_stale_markers(self.wpb_pub, "swp_wpb", len(components), self.last_wpb_marker_count)
-        self.last_region_marker_count = region_count
-        self.last_wpb_marker_count = len(components)
+        self._delete_stale_markers(self.region_pub, "swp_regions", current_region_ids, self.last_region_marker_ids)
+        self._delete_stale_markers(self.wpb_pub, "swp_wpb", current_wpb_ids, self.last_wpb_marker_ids)
+        self.last_region_marker_ids = current_region_ids
+        self.last_wpb_marker_ids = current_wpb_ids
+        self.last_region_marker_count = len(current_region_ids)
+        self.last_wpb_marker_count = len(current_wpb_ids)
 
     def _frontier_to_xy(self, frontier):
         return [float(frontier[0]), float(frontier[1])]
@@ -320,9 +422,24 @@ class SWPManager:
         return set()
 
     def _subregion_bounds(self, map_msg, context):
+        return self._subregion_bounds_for_center(map_msg, context, context["subregion_center"])
+
+    def _subregion_bounds_for_index(self, map_msg, context, subregion_idx):
+        if 0 <= subregion_idx < len(context["subregion_centers"]):
+            center = context["subregion_centers"][subregion_idx]
+        else:
+            subregion_width = context["map_size_resized"][0] / context["n_w"]
+            subregion_height = context["map_size_resized"][1] / context["n_h"]
+            center = [
+                context["map_origin_resized"][0] + int(subregion_idx % context["n_w"]) * subregion_width + subregion_width / 2.0,
+                context["map_origin_resized"][1] + int(subregion_idx / context["n_w"]) * subregion_height + subregion_height / 2.0,
+            ]
+        return self._subregion_bounds_for_center(map_msg, context, center)
+
+    def _subregion_bounds_for_center(self, map_msg, context, center):
         subregion_width = context["map_size_resized"][0] / context["n_w"]
         subregion_height = context["map_size_resized"][1] / context["n_h"]
-        center_x, center_y = context["subregion_center"]
+        center_x, center_y = center
         min_x = center_x - subregion_width / 2.0
         max_x = center_x + subregion_width / 2.0
         min_y = center_y - subregion_height / 2.0
@@ -337,6 +454,30 @@ class SWPManager:
             "min_y": min(min_cell[1], max_cell[1]),
             "max_y": max(min_cell[1], max_cell[1]),
         }
+
+    def _cluster_subregion(self, cluster, context):
+        centroid = [
+            sum(point[0] for point in cluster) / len(cluster),
+            sum(point[1] for point in cluster) / len(cluster),
+        ]
+        active_subregions = set(context["active_subregions"])
+        for subregion_idx in sorted(active_subregions):
+            if 0 <= subregion_idx < len(context["subregion_centers"]):
+                center = context["subregion_centers"][subregion_idx]
+            else:
+                continue
+            if self._is_inside_subregion(context, center, centroid):
+                return subregion_idx
+        return None
+
+    def _is_inside_subregion(self, context, center, point):
+        subregion_width = context["map_size_resized"][0] / context["n_w"]
+        subregion_height = context["map_size_resized"][1] / context["n_h"]
+        x1 = center[0] - subregion_width / 2.0
+        x2 = center[0] + subregion_width / 2.0
+        y1 = center[1] - subregion_height / 2.0
+        y2 = center[1] + subregion_height / 2.0
+        return x1 < point[0] < x2 and y1 < point[1] < y2
 
     def _world_to_cell(self, map_msg, point, clamp=False):
         resolution = map_msg.info.resolution
@@ -448,12 +589,15 @@ class SWPManager:
         self.wpb_pub.publish(wpb_clear)
         self.last_region_marker_count = 0
         self.last_wpb_marker_count = 0
+        self.last_region_marker_ids = set()
+        self.last_wpb_marker_ids = set()
 
-    def _delete_stale_markers(self, publisher, namespace, current_count, last_count):
-        if current_count >= last_count:
+    def _delete_stale_markers(self, publisher, namespace, current_ids, last_ids):
+        stale_ids = last_ids - current_ids
+        if not stale_ids:
             return
         delete_array = MarkerArray()
-        for marker_id in range(current_count, last_count):
+        for marker_id in sorted(stale_ids):
             marker = Marker()
             marker.header.frame_id = "map"
             marker.header.stamp = rospy.Time.now()
@@ -479,24 +623,54 @@ class SWPManager:
             "inspected_outside_map": 0,
         }
 
+    def _empty_result(self, context, raw_clusters, seed_stats, mode):
+        frontier_count = len(context["frontiers"])
+        if mode == "selected_subregion" and context["selected_frontiers"]:
+            frontier_count = len(context["selected_frontiers"])
+        return {
+            "regions": {},
+            "wpb_cells": set(),
+            "wpb_adjacent_labels": {},
+            "stats": {
+                "mode": mode,
+                "frontiers": frontier_count,
+                "total_frontiers": len(context["frontiers"]),
+                "selected_frontiers": len(context["selected_frontiers"]),
+                "raw_clusters": len(raw_clusters),
+                "valid_clusters": 0,
+                "dropped_clusters": 0,
+                "active_subregions": 0,
+                "seed_cells": 0,
+                "seed_failures": seed_stats,
+                "cluster_seed_counts": [],
+                "subregion_summaries": [],
+            },
+        }
+
     def _log_result(self, context, result):
         if not self.debug:
             return
         stats = result.get("stats", {})
         seed_failures = stats.get("seed_failures", {})
         cluster_seed_counts = stats.get("cluster_seed_counts", [])
+        subregion_summaries = stats.get("subregion_summaries", [])
         region_cells = sum(len(cells) for cells in result["regions"].values())
         rospy.loginfo_throttle(
             2.0,
-            "SWP selected_subregion=%s frontiers=%d clusters=%d/%d seeds=%d regions=%d region_cells=%d wpb_cells=%d cluster_seed_counts=%s seed_failures=%s",
+            "SWP mode=%s selected_subregion=%s frontiers=%d selected_frontiers=%d clusters=%d/%d dropped=%d active_subregions=%d seeds=%d regions=%d region_cells=%d wpb_cells=%d cluster_seed_counts=%s subregions=%s seed_failures=%s",
+            stats.get("mode", self.scope),
             context["selected_subregion"],
             stats.get("frontiers", 0),
+            stats.get("selected_frontiers", len(context["selected_frontiers"])),
             stats.get("valid_clusters", 0),
             stats.get("raw_clusters", 0),
+            stats.get("dropped_clusters", 0),
+            stats.get("active_subregions", 0),
             stats.get("seed_cells", 0),
             len(result["regions"]),
             region_cells,
             len(result["wpb_cells"]),
             cluster_seed_counts[:10],
+            subregion_summaries[:10],
             seed_failures,
         )

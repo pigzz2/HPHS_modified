@@ -180,6 +180,14 @@ Visualization Manager:
         swp_wpb: true
       Queue Size: 20
       Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /swp_seed_cells
+      Name: SWP Seed Cells
+      Namespaces:
+        swp_seed_cells: true
+      Queue Size: 20
+      Value: true
     - Class: rviz/Marker
       Enabled: true
       Marker Topic: /local_goal

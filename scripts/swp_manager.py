@@ -20,6 +20,10 @@ class SWPManager:
         self.wpb_alpha = float(rospy.get_param("~swp/wpb_alpha", 0.9))
         self.min_cluster_size = int(rospy.get_param("~swp/min_cluster_size", 1))
         self.seed_search_radius_cells = int(rospy.get_param("~swp/seed_search_radius_cells", 2))
+        self.seed_fallback_radius_cells = int(rospy.get_param("~swp/seed_fallback_radius_cells", 6))
+        self.publish_seed_cells = rospy.get_param("~swp/publish_seed_cells", True)
+        self.seed_z = float(rospy.get_param("~swp/seed_z", 0.35))
+        self.seed_alpha = float(rospy.get_param("~swp/seed_alpha", 1.0))
         self.scope = rospy.get_param("~swp/scope", "all_subregions")
         self.debug = rospy.get_param("~swp/debug", True)
 
@@ -31,10 +35,12 @@ class SWPManager:
         self.last_wpb_marker_count = 0
         self.last_region_marker_ids = set()
         self.last_wpb_marker_ids = set()
+        self.last_seed_marker_ids = set()
 
         self.map_sub = rospy.Subscriber("/map", OccupancyGrid, self.map_callback, queue_size=1)
         self.region_pub = rospy.Publisher("/swp_regions", MarkerArray, queue_size=1)
         self.wpb_pub = rospy.Publisher("/swp_wpb", MarkerArray, queue_size=1)
+        self.seed_pub = rospy.Publisher("/swp_seed_cells", MarkerArray, queue_size=1)
 
         period = 1.0 / self.update_rate if self.update_rate > 0.0 else 0.1
         self.timer = rospy.Timer(rospy.Duration(period), self.timer_callback)
@@ -163,6 +169,7 @@ class SWPManager:
         merged_regions = {}
         merged_wpb_cells = set()
         merged_wpb_adjacent_labels = defaultdict(set)
+        merged_seed_cells = set()
         merged_cluster_seed_counts = []
         subregion_summaries = []
         label_offset = 0
@@ -179,6 +186,7 @@ class SWPManager:
             )
             merged_regions.update(result["regions"])
             merged_wpb_cells.update(result["wpb_cells"])
+            merged_seed_cells.update(result["seed_cells"])
             for cell, labels in result["wpb_adjacent_labels"].items():
                 merged_wpb_adjacent_labels[cell].update(labels)
             merged_cluster_seed_counts.extend(result["stats"]["cluster_seed_counts"])
@@ -198,6 +206,7 @@ class SWPManager:
             "regions": merged_regions,
             "wpb_cells": merged_wpb_cells,
             "wpb_adjacent_labels": dict(merged_wpb_adjacent_labels),
+            "seed_cells": merged_seed_cells,
             "stats": {
                 "mode": "all_subregions",
                 "frontiers": len(context["frontiers"]),
@@ -220,6 +229,7 @@ class SWPManager:
         wpb_cells = set()
         wpb_adjacent_labels = defaultdict(set)
         active = deque()
+        all_seed_cells = set()
         seed_count = 0
         cluster_seed_counts = []
 
@@ -227,6 +237,7 @@ class SWPManager:
             label_id = label_offset + local_label_id
             seeds = self._cluster_seed_cells(map_msg, cluster, bounds, seed_stats)
             seed_count += len(seeds)
+            all_seed_cells.update(seeds)
             cluster_seed_counts.append(len(seeds))
             for cell in seeds:
                 if cell in wpb_cells:
@@ -287,6 +298,7 @@ class SWPManager:
             "regions": dict(regions),
             "wpb_cells": wpb_cells,
             "wpb_adjacent_labels": dict(wpb_adjacent_labels),
+            "seed_cells": all_seed_cells,
             "stats": {
                 "seed_cells": seed_count,
                 "seed_failures": seed_stats,
@@ -298,6 +310,7 @@ class SWPManager:
         stamp = rospy.Time.now()
         region_array = MarkerArray()
         wpb_array = MarkerArray()
+        seed_array = MarkerArray()
 
         current_region_ids = set()
         for label_id in sorted(result["regions"].keys()):
@@ -335,12 +348,32 @@ class SWPManager:
 
         self.region_pub.publish(region_array)
         self.wpb_pub.publish(wpb_array)
+        current_seed_ids = self._append_seed_markers(map_msg, stamp, result, seed_array)
+        self.seed_pub.publish(seed_array)
         self._delete_stale_markers(self.region_pub, "swp_regions", current_region_ids, self.last_region_marker_ids)
         self._delete_stale_markers(self.wpb_pub, "swp_wpb", current_wpb_ids, self.last_wpb_marker_ids)
+        self._delete_stale_markers(self.seed_pub, "swp_seed_cells", current_seed_ids, self.last_seed_marker_ids)
         self.last_region_marker_ids = current_region_ids
         self.last_wpb_marker_ids = current_wpb_ids
+        self.last_seed_marker_ids = current_seed_ids
         self.last_region_marker_count = len(current_region_ids)
         self.last_wpb_marker_count = len(current_wpb_ids)
+
+    def _append_seed_markers(self, map_msg, stamp, result, seed_array):
+        if not self.publish_seed_cells or not result["seed_cells"]:
+            return set()
+        marker = self._make_cube_list_marker(
+            frame_id=map_msg.header.frame_id or "map",
+            stamp=stamp,
+            ns="swp_seed_cells",
+            marker_id=0,
+            resolution=map_msg.info.resolution,
+            z=self.seed_z,
+            color=ColorRGBA(0.0, 0.0, 0.0, self.seed_alpha),
+        )
+        marker.points = [self._cell_to_point(map_msg, cell, self.seed_z) for cell in result["seed_cells"]]
+        seed_array.markers.append(marker)
+        return {0}
 
     def _frontier_to_xy(self, frontier):
         return [float(frontier[0]), float(frontier[1])]
@@ -384,42 +417,70 @@ class SWPManager:
         if not self._inside_bounds(anchor, bounds):
             seed_stats["anchor_outside_subregion"] += 1
 
+        search_radius = max(1, self.seed_search_radius_cells)
+        fallback_radius = max(search_radius, self.seed_fallback_radius_cells)
+        candidates, inspected = self._collect_unknown_candidates(map_msg, anchor, bounds, search_radius)
+        fallback_used = False
+        if not candidates and fallback_radius > search_radius:
+            fallback_candidates, fallback_inspected = self._collect_unknown_candidates(
+                map_msg,
+                anchor,
+                bounds,
+                fallback_radius,
+            )
+            candidates = fallback_candidates
+            inspected = fallback_inspected
+            fallback_used = bool(candidates)
+
+        if candidates:
+            min_distance = min(distance for _, distance in candidates)
+            selected = {cell for cell, distance in candidates if distance == min_distance}
+            seed_stats["seeded_frontiers"] += 1
+            if fallback_used:
+                seed_stats["seed_fallback_used"] += 1
+            seed_stats["max_seed_distance"] = max(seed_stats["max_seed_distance"], min_distance)
+            return selected
+
+        seed_stats["no_unknown_near_anchor"] += 1
+        for key, value in inspected.items():
+            seed_stats[key] += value
+        return set()
+
+    def _collect_unknown_candidates(self, map_msg, anchor, bounds, radius):
         inspected_unknown = 0
         inspected_free = 0
         inspected_occupied = 0
         inspected_outside_subregion = 0
         inspected_outside_map = 0
-        for radius in range(1, max(1, self.seed_search_radius_cells) + 1):
-            candidates = []
-            for dx in range(-radius, radius + 1):
-                for dy in range(-radius, radius + 1):
-                    if abs(dx) + abs(dy) != radius:
-                        continue
-                    cell = (anchor[0] + dx, anchor[1] + dy)
-                    if not self._inside_map(map_msg, cell):
-                        inspected_outside_map += 1
-                        continue
-                    if not self._inside_bounds(cell, bounds):
-                        inspected_outside_subregion += 1
-                        continue
-                    value = self._cell_value(map_msg, cell)
-                    if value == -1:
-                        inspected_unknown += 1
-                        candidates.append(cell)
-                    elif 0 <= value <= 10:
-                        inspected_free += 1
-                    else:
-                        inspected_occupied += 1
-            if candidates:
-                seed_stats["seeded_frontiers"] += 1
-                return set(candidates)
-        seed_stats["no_unknown_near_anchor"] += 1
-        seed_stats["inspected_unknown"] += inspected_unknown
-        seed_stats["inspected_free"] += inspected_free
-        seed_stats["inspected_occupied"] += inspected_occupied
-        seed_stats["inspected_outside_subregion"] += inspected_outside_subregion
-        seed_stats["inspected_outside_map"] += inspected_outside_map
-        return set()
+        candidates = []
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                distance = abs(dx) + abs(dy)
+                if distance == 0 or distance > radius:
+                    continue
+                cell = (anchor[0] + dx, anchor[1] + dy)
+                if not self._inside_map(map_msg, cell):
+                    inspected_outside_map += 1
+                    continue
+                if not self._inside_bounds(cell, bounds):
+                    inspected_outside_subregion += 1
+                    continue
+                value = self._cell_value(map_msg, cell)
+                if value == -1:
+                    inspected_unknown += 1
+                    candidates.append((cell, distance))
+                elif 0 <= value <= 10:
+                    inspected_free += 1
+                else:
+                    inspected_occupied += 1
+        inspected = {
+            "inspected_unknown": inspected_unknown,
+            "inspected_free": inspected_free,
+            "inspected_occupied": inspected_occupied,
+            "inspected_outside_subregion": inspected_outside_subregion,
+            "inspected_outside_map": inspected_outside_map,
+        }
+        return candidates, inspected
 
     def _subregion_bounds(self, map_msg, context):
         return self._subregion_bounds_for_center(map_msg, context, context["subregion_center"])
@@ -585,12 +646,18 @@ class SWPManager:
         wpb_marker = Marker()
         wpb_marker.action = Marker.DELETEALL
         wpb_clear.markers.append(wpb_marker)
+        seed_clear = MarkerArray()
+        seed_marker = Marker()
+        seed_marker.action = Marker.DELETEALL
+        seed_clear.markers.append(seed_marker)
         self.region_pub.publish(region_clear)
         self.wpb_pub.publish(wpb_clear)
+        self.seed_pub.publish(seed_clear)
         self.last_region_marker_count = 0
         self.last_wpb_marker_count = 0
         self.last_region_marker_ids = set()
         self.last_wpb_marker_ids = set()
+        self.last_seed_marker_ids = set()
 
     def _delete_stale_markers(self, publisher, namespace, current_ids, last_ids):
         stale_ids = last_ids - current_ids
@@ -616,6 +683,8 @@ class SWPManager:
             "anchor_outside_map": 0,
             "anchor_outside_subregion": 0,
             "no_unknown_near_anchor": 0,
+            "seed_fallback_used": 0,
+            "max_seed_distance": 0,
             "inspected_unknown": 0,
             "inspected_free": 0,
             "inspected_occupied": 0,
@@ -631,6 +700,7 @@ class SWPManager:
             "regions": {},
             "wpb_cells": set(),
             "wpb_adjacent_labels": {},
+            "seed_cells": set(),
             "stats": {
                 "mode": mode,
                 "frontiers": frontier_count,
@@ -657,7 +727,7 @@ class SWPManager:
         region_cells = sum(len(cells) for cells in result["regions"].values())
         rospy.loginfo_throttle(
             2.0,
-            "SWP mode=%s selected_subregion=%s frontiers=%d selected_frontiers=%d clusters=%d/%d dropped=%d active_subregions=%d seeds=%d regions=%d region_cells=%d wpb_cells=%d cluster_seed_counts=%s subregions=%s seed_failures=%s",
+            "SWP mode=%s selected_subregion=%s frontiers=%d selected_frontiers=%d clusters=%d/%d dropped=%d active_subregions=%d seeds=%d seed_fallback_used=%d max_seed_distance=%d regions=%d region_cells=%d wpb_cells=%d cluster_seed_counts=%s subregions=%s seed_failures=%s",
             stats.get("mode", self.scope),
             context["selected_subregion"],
             stats.get("frontiers", 0),
@@ -667,6 +737,8 @@ class SWPManager:
             stats.get("dropped_clusters", 0),
             stats.get("active_subregions", 0),
             stats.get("seed_cells", 0),
+            seed_failures.get("seed_fallback_used", 0),
+            seed_failures.get("max_seed_distance", 0),
             len(result["regions"]),
             region_cells,
             len(result["wpb_cells"]),

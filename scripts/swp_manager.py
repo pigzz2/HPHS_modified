@@ -36,6 +36,10 @@ class SWPManager:
         self.last_region_marker_ids = set()
         self.last_wpb_marker_ids = set()
         self.last_seed_marker_ids = set()
+        self.last_source_signature = None
+        self.last_seed_signature = None
+        self.last_region_signature = None
+        self.last_wpb_signature = None
 
         self.map_sub = rospy.Subscriber("/map", OccupancyGrid, self.map_callback, queue_size=1)
         self.region_pub = rospy.Publisher("/swp_regions", MarkerArray, queue_size=1)
@@ -114,8 +118,9 @@ class SWPManager:
             self.last_context_key = context_key
 
         result = self.updateSWP(map_msg, context)
-        self._log_result(context, result)
+        self._attach_publish_stats(result)
         self.publish_result(map_msg, result)
+        self._log_result(context, result)
 
     def updateSWP(self, map_msg, context):
         if self.scope == "all_subregions":
@@ -143,6 +148,7 @@ class SWPManager:
             "raw_clusters": len(raw_clusters),
             "valid_clusters": len(clusters),
             "active_subregions": 1,
+            "source_signature": self._clusters_signature(clusters),
         })
         return result
 
@@ -221,6 +227,7 @@ class SWPManager:
                 "cluster_seed_counts": merged_cluster_seed_counts,
                 "subregion_summaries": subregion_summaries,
                 "region_cells": region_cells,
+                "source_signature": self._clusters_by_subregion_signature(clusters_by_subregion),
             },
         }
 
@@ -311,6 +318,7 @@ class SWPManager:
         region_array = MarkerArray()
         wpb_array = MarkerArray()
         seed_array = MarkerArray()
+        publish_stats = result.setdefault("publish_stats", {})
 
         current_region_ids = set()
         for label_id in sorted(result["regions"].keys()):
@@ -349,6 +357,9 @@ class SWPManager:
         self.region_pub.publish(region_array)
         self.wpb_pub.publish(wpb_array)
         current_seed_ids = self._append_seed_markers(map_msg, stamp, result, seed_array)
+        publish_stats["seed_marker_points"] = sum(len(marker.points) for marker in seed_array.markers)
+        publish_stats["seed_marker_count"] = len(seed_array.markers)
+        publish_stats["seed_publish_enabled"] = self.publish_seed_cells
         self.seed_pub.publish(seed_array)
         self._delete_stale_markers(self.region_pub, "swp_regions", current_region_ids, self.last_region_marker_ids)
         self._delete_stale_markers(self.wpb_pub, "swp_wpb", current_wpb_ids, self.last_wpb_marker_ids)
@@ -714,20 +725,76 @@ class SWPManager:
                 "seed_failures": seed_stats,
                 "cluster_seed_counts": [],
                 "subregion_summaries": [],
+                "source_signature": self._sequence_signature([]),
             },
         }
+
+    def _attach_publish_stats(self, result):
+        source_signature = result["stats"].get(
+            "source_signature",
+            self._sequence_signature(result["stats"].get("cluster_seed_counts", [])),
+        )
+        seed_signature = self._cell_signature(result["seed_cells"])
+        region_signature = self._region_signature(result["regions"])
+        wpb_signature = self._cell_signature(result["wpb_cells"])
+
+        result["publish_stats"] = {
+            "source_signature": source_signature,
+            "seed_signature": seed_signature,
+            "region_signature": region_signature,
+            "wpb_signature": wpb_signature,
+            "source_changed": self.last_source_signature is not None and source_signature != self.last_source_signature,
+            "seed_changed": self.last_seed_signature is not None and seed_signature != self.last_seed_signature,
+            "region_changed": self.last_region_signature is not None and region_signature != self.last_region_signature,
+            "wpb_changed": self.last_wpb_signature is not None and wpb_signature != self.last_wpb_signature,
+            "seed_marker_points": 0,
+            "seed_marker_count": 0,
+            "seed_publish_enabled": self.publish_seed_cells,
+        }
+        self.last_source_signature = source_signature
+        self.last_seed_signature = seed_signature
+        self.last_region_signature = region_signature
+        self.last_wpb_signature = wpb_signature
+
+    def _sequence_signature(self, values):
+        return hash(tuple(values))
+
+    def _clusters_signature(self, clusters):
+        serialized_clusters = []
+        for cluster in clusters:
+            points = tuple(sorted((round(point[0], 2), round(point[1], 2)) for point in cluster))
+            serialized_clusters.append(points)
+        return hash(tuple(sorted(serialized_clusters)))
+
+    def _clusters_by_subregion_signature(self, clusters_by_subregion):
+        serialized_subregions = []
+        for subregion_idx in sorted(clusters_by_subregion.keys()):
+            serialized_subregions.append(
+                (subregion_idx, self._clusters_signature(clusters_by_subregion[subregion_idx]))
+            )
+        return hash(tuple(serialized_subregions))
+
+    def _cell_signature(self, cells):
+        return hash(tuple(sorted(cells)))
+
+    def _region_signature(self, regions):
+        items = []
+        for label_id in sorted(regions.keys()):
+            items.append((label_id, self._cell_signature(regions[label_id]), len(regions[label_id])))
+        return hash(tuple(items))
 
     def _log_result(self, context, result):
         if not self.debug:
             return
         stats = result.get("stats", {})
+        publish_stats = result.get("publish_stats", {})
         seed_failures = stats.get("seed_failures", {})
         cluster_seed_counts = stats.get("cluster_seed_counts", [])
         subregion_summaries = stats.get("subregion_summaries", [])
         region_cells = sum(len(cells) for cells in result["regions"].values())
         rospy.loginfo_throttle(
             2.0,
-            "SWP mode=%s selected_subregion=%s frontiers=%d selected_frontiers=%d clusters=%d/%d dropped=%d active_subregions=%d seeds=%d seed_fallback_used=%d max_seed_distance=%d regions=%d region_cells=%d wpb_cells=%d cluster_seed_counts=%s subregions=%s seed_failures=%s",
+            "SWP mode=%s selected_subregion=%s frontiers=%d selected_frontiers=%d clusters=%d/%d dropped=%d active_subregions=%d seeds=%d seed_marker_points=%d seed_marker_count=%d seed_publish_enabled=%s seed_changed=%s source_changed=%s region_changed=%s wpb_changed=%s seed_fallback_used=%d max_seed_distance=%d regions=%d region_cells=%d wpb_cells=%d cluster_seed_counts=%s subregions=%s seed_failures=%s",
             stats.get("mode", self.scope),
             context["selected_subregion"],
             stats.get("frontiers", 0),
@@ -737,6 +804,13 @@ class SWPManager:
             stats.get("dropped_clusters", 0),
             stats.get("active_subregions", 0),
             stats.get("seed_cells", 0),
+            publish_stats.get("seed_marker_points", 0),
+            publish_stats.get("seed_marker_count", 0),
+            publish_stats.get("seed_publish_enabled", self.publish_seed_cells),
+            publish_stats.get("seed_changed", False),
+            publish_stats.get("source_changed", False),
+            publish_stats.get("region_changed", False),
+            publish_stats.get("wpb_changed", False),
             seed_failures.get("seed_fallback_used", 0),
             seed_failures.get("max_seed_distance", 0),
             len(result["regions"]),

@@ -699,7 +699,7 @@ class Explorer:
         total_frontiers.color.a = 0.6
         total_frontiers.color.r = 0
         total_frontiers.color.g = 0
-        total_frontiers.color.b = 1.0
+        total_frontiers.color.b = 0.0
         total_frontiers.pose.orientation.w = 1.0
 
         for frontier in self.total_frontiers:

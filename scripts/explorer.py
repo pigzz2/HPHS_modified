@@ -869,15 +869,37 @@ class Explorer:
 
     def updateSWPContext(self):
         if len(self.classflied_frontiers) == 0:
+            rospy.loginfo_throttle(2.0, "SWP context cleared: no classified frontiers")
             self.swp_manager.clear_context()
             return
         if self.selected_subregion >= len(self.classflied_frontiers):
+            rospy.loginfo_throttle(
+                2.0,
+                "SWP context cleared: selected_subregion=%d classified_frontier_slots=%d",
+                self.selected_subregion,
+                len(self.classflied_frontiers),
+            )
             self.swp_manager.clear_context()
             return
         if self.selected_subregion >= len(self.subregion_center):
+            rospy.loginfo_throttle(
+                2.0,
+                "SWP context cleared: selected_subregion=%d subregion_centers=%d",
+                self.selected_subregion,
+                len(self.subregion_center),
+            )
             self.swp_manager.clear_context()
             return
 
+        selected_frontiers = self.classflied_frontiers[self.selected_subregion]
+        rospy.loginfo_throttle(
+            2.0,
+            "SWP context input: selected_subregion=%d total_frontiers=%d selected_frontiers=%d subregions=%d",
+            self.selected_subregion,
+            len(self.total_frontiers),
+            len(selected_frontiers),
+            len(self.subregions),
+        )
         self.swp_manager.set_context(
             selected_subregion=self.selected_subregion,
             subregion_center=self.subregion_center[self.selected_subregion],
@@ -885,7 +907,7 @@ class Explorer:
             map_size_resized=[self.map_width_resized, self.map_height_resized],
             n_w=self.n_w,
             n_h=self.n_h,
-            frontiers=self.classflied_frontiers[self.selected_subregion],
+            frontiers=selected_frontiers,
             frontier_cluster_dist=self.total_frontier_vicinity,
         )
 

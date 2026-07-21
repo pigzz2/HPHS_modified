@@ -16,7 +16,7 @@ class SWPManager:
         self.update_rate = float(rospy.get_param("~swp/update_rate", 10.0))
         self.region_z = float(rospy.get_param("~swp/region_z", 0.15))
         self.wpb_z = float(rospy.get_param("~swp/wpb_z", 0.25))
-        self.region_alpha = float(rospy.get_param("~swp/region_alpha", 0.35))
+        self.region_alpha = float(rospy.get_param("~swp/region_alpha", 0.75))
         self.wpb_alpha = float(rospy.get_param("~swp/wpb_alpha", 0.9))
         self.min_cluster_size = int(rospy.get_param("~swp/min_cluster_size", 1))
         self.seed_search_radius_cells = int(rospy.get_param("~swp/seed_search_radius_cells", 2))
@@ -378,14 +378,16 @@ class SWPManager:
 
     def _region_color(self, label_id):
         palette = [
-            (0.10, 0.45, 0.95),
-            (0.95, 0.55, 0.10),
-            (0.20, 0.75, 0.35),
-            (0.90, 0.20, 0.30),
-            (0.55, 0.35, 0.95),
-            (0.00, 0.70, 0.75),
-            (0.95, 0.80, 0.15),
-            (0.85, 0.35, 0.70),
+            (0.00, 0.36, 1.00),
+            (1.00, 0.42, 0.00),
+            (0.00, 0.88, 0.18),
+            (1.00, 0.00, 0.18),
+            (0.62, 0.00, 1.00),
+            (0.00, 0.92, 1.00),
+            (1.00, 0.86, 0.00),
+            (1.00, 0.00, 0.72),
+            (0.50, 1.00, 0.00),
+            (0.00, 0.58, 0.32),
         ]
         r, g, b = palette[label_id % len(palette)]
         return ColorRGBA(r, g, b, self.region_alpha)

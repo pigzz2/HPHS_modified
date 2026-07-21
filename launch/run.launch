@@ -5,7 +5,7 @@
         <param name="swp/update_rate" value="10.0" />
         <param name="swp/region_z" value="0.15" />
         <param name="swp/wpb_z" value="0.25" />
-        <param name="swp/region_alpha" value="0.35" />
+        <param name="swp/region_alpha" value="0.75" />
         <param name="swp/wpb_alpha" value="0.9" />
         <param name="swp/min_cluster_size" value="1" />
         <param name="swp/seed_search_radius_cells" value="2" />

@@ -804,7 +804,7 @@ class Explorer:
         subregions.scale.x = self.map_width_resized / self.n_w
         subregions.scale.y = self.map_height_resized / self.n_h
         subregions.scale.z = 1.0
-        subregions.color.a = 0.6
+        subregions.color.a = 0.15
         subregions.color.r = 0.0
         subregions.color.g = 0.3
         subregions.color.b = 0.0
@@ -834,7 +834,7 @@ class Explorer:
         selected_subregion.scale.x = self.map_width_resized / self.n_w
         selected_subregion.scale.y = self.map_height_resized / self.n_h
         selected_subregion.scale.z = 1.0
-        selected_subregion.color.a = 0.6
+        selected_subregion.color.a = 0.20
         selected_subregion.color.r = 0.0
         selected_subregion.color.g = 0.0
         selected_subregion.color.b = 0.3

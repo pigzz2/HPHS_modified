@@ -164,6 +164,22 @@ Visualization Manager:
         selected_subregion: true
       Queue Size: 100
       Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /swp_regions
+      Name: SWP Regions
+      Namespaces:
+        swp_regions: true
+      Queue Size: 20
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /swp_wpb
+      Name: SWP WPB
+      Namespaces:
+        swp_wpb: true
+      Queue Size: 20
+      Value: true
     - Class: rviz/Marker
       Enabled: true
       Marker Topic: /local_goal

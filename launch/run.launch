@@ -1,4 +1,14 @@
 <launch>
     <env name="PYTHONPATH" value="$(find HPHS)/scripts:$(env PYTHONPATH)" />
-    <node pkg="HPHS" type="explorer.py"  name="explorer" output="screen" />
+    <node pkg="HPHS" type="explorer.py"  name="explorer" output="screen">
+        <param name="swp/enabled" value="true" />
+        <param name="swp/update_rate" value="10.0" />
+        <param name="swp/region_z" value="0.15" />
+        <param name="swp/wpb_z" value="0.25" />
+        <param name="swp/region_alpha" value="0.35" />
+        <param name="swp/wpb_alpha" value="0.9" />
+        <param name="swp/min_cluster_size" value="1" />
+        <param name="swp/seed_search_radius_cells" value="2" />
+        <param name="swp/debug" value="true" />
+    </node>
 </launch>

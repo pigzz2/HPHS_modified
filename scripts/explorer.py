@@ -19,6 +19,7 @@ from collections import deque, defaultdict
 from copy import copy
 from itertools import permutations
 from dtw import dtw
+from swp_manager import SWPManager
 
 class Explorer:
     def __init__(self):
@@ -121,6 +122,9 @@ class Explorer:
         
         # Transform listener
         self.listener = tranf.TransformListener()
+
+        # SWP is visualization-only and does not affect HPHS exploration decisions.
+        self.swp_manager = SWPManager()
 
     def cloud_callback(self, cloud_msgs):
         cloud_list = list(pc2.read_points(cloud_msgs, field_names=("x", "y", "z"), skip_nans=True))
@@ -863,6 +867,28 @@ class Explorer:
         self.global_path_pub.publish(global_path)
     ## ------------------------------------------------------------------------- ##
 
+    def updateSWPContext(self):
+        if len(self.classflied_frontiers) == 0:
+            self.swp_manager.clear_context()
+            return
+        if self.selected_subregion >= len(self.classflied_frontiers):
+            self.swp_manager.clear_context()
+            return
+        if self.selected_subregion >= len(self.subregion_center):
+            self.swp_manager.clear_context()
+            return
+
+        self.swp_manager.set_context(
+            selected_subregion=self.selected_subregion,
+            subregion_center=self.subregion_center[self.selected_subregion],
+            map_origin_resized=[self.map_origin_x_resized, self.map_origin_y_resized],
+            map_size_resized=[self.map_width_resized, self.map_height_resized],
+            n_w=self.n_w,
+            n_h=self.n_h,
+            frontiers=self.classflied_frontiers[self.selected_subregion],
+            frontier_cluster_dist=self.total_frontier_vicinity,
+        )
+
     def run(self):
         while self.laser_data is None or self.map_data is None:
             pass
@@ -875,6 +901,7 @@ class Explorer:
         self.setSubregion()
         self.classflyFrontiers()
         self.arrangeSubregion()
+        self.updateSWPContext()
 
         self.selectLocalGoal()
         self.sendLocalGoal()

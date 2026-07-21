@@ -3,6 +3,9 @@ project(HPHS)
 
 find_package(catkin REQUIRED COMPONENTS
   rospy
+  nav_msgs
+  std_msgs
+  visualization_msgs
   pcl_ros
   pcl_conversions
   sensor_msgs
@@ -22,4 +25,3 @@ include_directories(
 catkin_install_python(PROGRAMS
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
-

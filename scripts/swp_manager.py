@@ -117,10 +117,12 @@ class SWPManager:
                 round(context["subregion_center"][1], 3),
             )
         if context_key != self.last_context_key:
-            self._clear_markers(
-                reason="context_key_changed",
-                old_context_key=self.last_context_key,
-                new_context_key=context_key,
+            rospy.logwarn(
+                "SWP_CONTEXT_KEY_CHANGED old=%s new=%s last_regions=%d last_wpb=%d",
+                self.last_context_key,
+                context_key,
+                self.last_region_marker_count,
+                self.last_wpb_marker_count,
             )
             self.last_context_key = context_key
 

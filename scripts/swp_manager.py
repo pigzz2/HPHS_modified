@@ -81,7 +81,7 @@ class SWPManager:
 
     def timer_callback(self, _event):
         if not self.enabled:
-            self._clear_markers()
+            self._clear_markers(reason="swp_disabled")
             return
 
         with self.lock:
@@ -92,7 +92,7 @@ class SWPManager:
             if context is None and (self.last_context_key is not None or
                                     self.last_region_marker_count > 0 or
                                     self.last_wpb_marker_count > 0):
-                self._clear_markers()
+                self._clear_markers(reason="context_missing")
                 self.last_context_key = None
             return
 
@@ -117,7 +117,11 @@ class SWPManager:
                 round(context["subregion_center"][1], 3),
             )
         if context_key != self.last_context_key:
-            self._clear_markers()
+            self._clear_markers(
+                reason="context_key_changed",
+                old_context_key=self.last_context_key,
+                new_context_key=context_key,
+            )
             self.last_context_key = context_key
 
         result = self.updateSWP(map_msg, context)
@@ -654,7 +658,17 @@ class SWPManager:
         r, g, b = palette[label_id % len(palette)]
         return ColorRGBA(r, g, b, self.region_alpha)
 
-    def _clear_markers(self):
+    def _clear_markers(self, reason, old_context_key=None, new_context_key=None):
+        rospy.logwarn(
+            "SWP_CLEAR reason=%s old=%s new=%s last_regions=%d last_wpb=%d last_region_ids=%s last_wpb_ids=%s",
+            reason,
+            old_context_key,
+            new_context_key,
+            self.last_region_marker_count,
+            self.last_wpb_marker_count,
+            sorted(self.last_region_marker_ids)[:20],
+            sorted(self.last_wpb_marker_ids)[:20],
+        )
         region_clear = MarkerArray()
         region_marker = Marker()
         region_marker.action = Marker.DELETEALL
@@ -726,6 +740,17 @@ class SWPManager:
             for label_id, cells in region_cells.items()
         }
 
+        if created > 0 or (region_cells and reused == 0):
+            rospy.logwarn(
+                "SWP_REGION_TRACK reused=%d new=%d tracks=%d min_overlap=%.3f labels=%s marker_ids=%s",
+                reused,
+                created,
+                len(self.region_marker_tracks),
+                self.marker_id_min_overlap_ratio,
+                sorted(region_cells.keys())[:20],
+                sorted(label_to_marker_id.values())[:20],
+            )
+
         return label_to_marker_id, {
             "region_marker_reused": reused,
             "region_marker_new": created,
@@ -736,6 +761,16 @@ class SWPManager:
         stale_ids = last_ids - current_ids
         if not stale_ids:
             return
+        if namespace in ("swp_regions", "swp_wpb"):
+            rospy.logwarn(
+                "SWP_STALE_DELETE namespace=%s stale=%d current=%d last=%d stale_ids=%s current_ids=%s",
+                namespace,
+                len(stale_ids),
+                len(current_ids),
+                len(last_ids),
+                sorted(stale_ids)[:20],
+                sorted(current_ids)[:20],
+            )
         delete_array = MarkerArray()
         for marker_id in sorted(stale_ids):
             marker = Marker()

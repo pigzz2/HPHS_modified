@@ -117,13 +117,13 @@ class SWPManager:
                 round(context["subregion_center"][1], 3),
             )
         if context_key != self.last_context_key:
-            rospy.logwarn(
-                "SWP_CONTEXT_KEY_CHANGED old=%s new=%s last_regions=%d last_wpb=%d",
-                self.last_context_key,
-                context_key,
-                self.last_region_marker_count,
-                self.last_wpb_marker_count,
-            )
+            # rospy.logwarn(
+            #     "SWP_CONTEXT_KEY_CHANGED old=%s new=%s last_regions=%d last_wpb=%d",
+            #     self.last_context_key,
+            #     context_key,
+            #     self.last_region_marker_count,
+            #     self.last_wpb_marker_count,
+            # )
             self.last_context_key = context_key
 
         result = self.updateSWP(map_msg, context)
@@ -661,16 +661,16 @@ class SWPManager:
         return ColorRGBA(r, g, b, self.region_alpha)
 
     def _clear_markers(self, reason, old_context_key=None, new_context_key=None):
-        rospy.logwarn(
-            "SWP_CLEAR reason=%s old=%s new=%s last_regions=%d last_wpb=%d last_region_ids=%s last_wpb_ids=%s",
-            reason,
-            old_context_key,
-            new_context_key,
-            self.last_region_marker_count,
-            self.last_wpb_marker_count,
-            sorted(self.last_region_marker_ids)[:20],
-            sorted(self.last_wpb_marker_ids)[:20],
-        )
+        # rospy.logwarn(
+        #     "SWP_CLEAR reason=%s old=%s new=%s last_regions=%d last_wpb=%d last_region_ids=%s last_wpb_ids=%s",
+        #     reason,
+        #     old_context_key,
+        #     new_context_key,
+        #     self.last_region_marker_count,
+        #     self.last_wpb_marker_count,
+        #     sorted(self.last_region_marker_ids)[:20],
+        #     sorted(self.last_wpb_marker_ids)[:20],
+        # )
         region_clear = MarkerArray()
         region_marker = Marker()
         region_marker.action = Marker.DELETEALL
@@ -742,16 +742,16 @@ class SWPManager:
             for label_id, cells in region_cells.items()
         }
 
-        if created > 0 or (region_cells and reused == 0):
-            rospy.logwarn(
-                "SWP_REGION_TRACK reused=%d new=%d tracks=%d min_overlap=%.3f labels=%s marker_ids=%s",
-                reused,
-                created,
-                len(self.region_marker_tracks),
-                self.marker_id_min_overlap_ratio,
-                sorted(region_cells.keys())[:20],
-                sorted(label_to_marker_id.values())[:20],
-            )
+        # if created > 0 or (region_cells and reused == 0):
+        #     rospy.logwarn(
+        #         "SWP_REGION_TRACK reused=%d new=%d tracks=%d min_overlap=%.3f labels=%s marker_ids=%s",
+        #         reused,
+        #         created,
+        #         len(self.region_marker_tracks),
+        #         self.marker_id_min_overlap_ratio,
+        #         sorted(region_cells.keys())[:20],
+        #         sorted(label_to_marker_id.values())[:20],
+        #     )
 
         return label_to_marker_id, {
             "region_marker_reused": reused,
@@ -763,16 +763,16 @@ class SWPManager:
         stale_ids = last_ids - current_ids
         if not stale_ids:
             return
-        if namespace in ("swp_regions", "swp_wpb"):
-            rospy.logwarn(
-                "SWP_STALE_DELETE namespace=%s stale=%d current=%d last=%d stale_ids=%s current_ids=%s",
-                namespace,
-                len(stale_ids),
-                len(current_ids),
-                len(last_ids),
-                sorted(stale_ids)[:20],
-                sorted(current_ids)[:20],
-            )
+        # if namespace in ("swp_regions", "swp_wpb"):
+        #     rospy.logwarn(
+        #         "SWP_STALE_DELETE namespace=%s stale=%d current=%d last=%d stale_ids=%s current_ids=%s",
+        #         namespace,
+        #         len(stale_ids),
+        #         len(current_ids),
+        #         len(last_ids),
+        #         sorted(stale_ids)[:20],
+        #         sorted(current_ids)[:20],
+        #     )
         delete_array = MarkerArray()
         for marker_id in sorted(stale_ids):
             marker = Marker()
@@ -885,40 +885,5 @@ class SWPManager:
     def _log_result(self, context, result):
         if not self.debug:
             return
-        stats = result.get("stats", {})
-        publish_stats = result.get("publish_stats", {})
-        seed_failures = stats.get("seed_failures", {})
-        cluster_seed_counts = stats.get("cluster_seed_counts", [])
-        subregion_summaries = stats.get("subregion_summaries", [])
-        region_cells = sum(len(cells) for cells in result["regions"].values())
-        rospy.loginfo_throttle(
-            2.0,
-            "SWP mode=%s selected_subregion=%s frontiers=%d selected_frontiers=%d clusters=%d/%d dropped=%d active_subregions=%d seeds=%d seed_marker_points=%d seed_marker_count=%d seed_publish_enabled=%s seed_changed=%s source_changed=%s region_changed=%s wpb_changed=%s region_marker_reused=%d region_marker_new=%d region_marker_tracks=%d seed_fallback_used=%d max_seed_distance=%d regions=%d region_cells=%d wpb_cells=%d cluster_seed_counts=%s subregions=%s seed_failures=%s",
-            stats.get("mode", self.scope),
-            context["selected_subregion"],
-            stats.get("frontiers", 0),
-            stats.get("selected_frontiers", len(context["selected_frontiers"])),
-            stats.get("valid_clusters", 0),
-            stats.get("raw_clusters", 0),
-            stats.get("dropped_clusters", 0),
-            stats.get("active_subregions", 0),
-            stats.get("seed_cells", 0),
-            publish_stats.get("seed_marker_points", 0),
-            publish_stats.get("seed_marker_count", 0),
-            publish_stats.get("seed_publish_enabled", self.publish_seed_cells),
-            publish_stats.get("seed_changed", False),
-            publish_stats.get("source_changed", False),
-            publish_stats.get("region_changed", False),
-            publish_stats.get("wpb_changed", False),
-            publish_stats.get("region_marker_reused", 0),
-            publish_stats.get("region_marker_new", 0),
-            publish_stats.get("region_marker_tracks", 0),
-            seed_failures.get("seed_fallback_used", 0),
-            seed_failures.get("max_seed_distance", 0),
-            len(result["regions"]),
-            region_cells,
-            len(result["wpb_cells"]),
-            cluster_seed_counts[:10],
-            subregion_summaries[:10],
-            seed_failures,
-        )
+        # Diagnostic logging disabled after SWP flicker investigation.
+        return

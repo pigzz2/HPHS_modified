@@ -330,14 +330,13 @@ class SWPManager:
         publish_stats = result.setdefault("publish_stats", {})
 
         current_region_ids = set()
-        # Region marker overlap tracking is temporarily disabled for visual comparison.
-        # region_marker_ids, region_marker_stats = self._assign_region_marker_ids(result["regions"])
-        # publish_stats.update(region_marker_stats)
+        region_marker_ids, region_marker_stats = self._assign_region_marker_ids(result["regions"])
+        publish_stats.update(region_marker_stats)
         for label_id in sorted(result["regions"].keys()):
             cells = result["regions"][label_id]
             if not cells:
                 continue
-            marker_id = label_id
+            marker_id = region_marker_ids[label_id]
             marker = self._make_cube_list_marker(
                 frame_id=map_msg.header.frame_id or "map",
                 stamp=stamp,
@@ -345,7 +344,7 @@ class SWPManager:
                 marker_id=marker_id,
                 resolution=map_msg.info.resolution,
                 z=self.region_z,
-                color=self._region_color(label_id),
+                color=self._region_color(marker_id),
             )
             marker.points = [self._cell_to_point(map_msg, cell, self.region_z) for cell in cells]
             region_array.markers.append(marker)

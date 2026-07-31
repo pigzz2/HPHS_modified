@@ -188,6 +188,17 @@ Visualization Manager:
         swp_seed_cells: true
       Queue Size: 20
       Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uez_viewpoint
+      Name: UEZ Viewpoint
+      Namespaces:
+        observation_goal: true
+        uez_centroid: true
+        uez_view_lines: true
+        wave_source: true
+      Queue Size: 20
+      Value: true
     - Class: rviz/Marker
       Enabled: true
       Marker Topic: /local_goal

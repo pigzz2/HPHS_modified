@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import heapq
+import math
 import rospy
 import actionlib
 import cv2
@@ -11,7 +13,7 @@ from std_msgs.msg import Float32
 from sensor_msgs.msg import PointCloud2, LaserScan
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from nav_msgs.msg import Odometry, Path, OccupancyGrid
-from visualization_msgs.msg import Marker
+from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point, PointStamped
 from tf.transformations import euler_from_quaternion
 from pyquaternion import Quaternion
@@ -77,6 +79,7 @@ class Explorer:
         self.laser_data = None
         # Map data
         self.map_data = None
+        self.map_msg = None
         self.map_resolution = None
         self.map_origin_x = None
         self.map_origin_y = None
@@ -93,10 +96,24 @@ class Explorer:
         self.inf_frontiers   = deque()
         self.img_frontiers   = deque()
 
+        self.frontier_goal = [0, 0]
         self.local_goal = [0, 0]
+        self.observation_goal = None
+        self.observation_goal_frontier = None
+        self.observation_goal_reached = False
+        self.uez_viewpoint_info = None
         self.end_exploration = False
 
         rospy.init_node("exploration")
+        self.uez_viewpoint_enabled = rospy.get_param("~uez_viewpoint/enabled", True)
+        self.uez_d_look = float(rospy.get_param("~uez_viewpoint/d_look", 2.0))
+        self.uez_reach_tolerance = float(rospy.get_param("~uez_viewpoint/reach_tolerance", 0.8))
+        self.uez_sample_count = int(rospy.get_param("~uez_viewpoint/sample_count", 80))
+        self.uez_min_obstacle_clearance = float(rospy.get_param("~uez_viewpoint/min_obstacle_clearance", 0.4))
+        self.uez_fallback_to_frontier = rospy.get_param("~uez_viewpoint/fallback_to_frontier", True)
+        self.uez_min_view_distance = float(rospy.get_param("~uez_viewpoint/min_view_distance", 1.0))
+        self.uez_no_backtrack_margin = float(rospy.get_param("~uez_viewpoint/no_backtrack_margin", 0.5))
+        self.uez_alignment_weight = float(rospy.get_param("~uez_viewpoint/alignment_weight", 0.3))
         # Publisher
         self.total_frontiers_pub = rospy.Publisher("/total_frontiers", Marker, queue_size=1)
         self.gap_frontiers_pub = rospy.Publisher("/gap_frontiers", Marker, queue_size=1)
@@ -107,6 +124,7 @@ class Explorer:
         self.selected_subregion_pub = rospy.Publisher("/selected_subregion", Marker, queue_size=1)
         self.global_path_pub = rospy.Publisher("/global_path", Marker, queue_size=1)
         self.local_goal_pub = rospy.Publisher("/local_goal", Marker, queue_size=1)
+        self.uez_viewpoint_pub = rospy.Publisher("/uez_viewpoint", MarkerArray, queue_size=1)
         self.waypoint_pub = rospy.Publisher("/way_point", PointStamped, queue_size=1)
         self.runtime_pub = rospy.Publisher("/runtime", Float32, queue_size=1)
         
@@ -123,7 +141,7 @@ class Explorer:
         # Transform listener
         self.listener = tranf.TransformListener()
 
-        # SWP is visualization-only and does not affect HPHS exploration decisions.
+        # SWP provides UEZ geometry when the viewpoint policy is enabled.
         self.swp_manager = SWPManager()
 
     def cloud_callback(self, cloud_msgs):
@@ -158,6 +176,7 @@ class Explorer:
         self.angle = round(euler[2], 4)
 
     def map_callback(self, map_data):
+        self.map_msg = map_data
         self.map_data = map_data.data
         self.map_resolution = map_data.info.resolution
         self.map_width = map_data.info.width
@@ -178,6 +197,8 @@ class Explorer:
             waypoint.point.x = path_poses[15].pose.position.x
             waypoint.point.y = path_poses[15].pose.position.y
         else:
+            if len(self.local_goal) < 2:
+                return
             waypoint.point.x = self.local_goal[0]
             waypoint.point.y = self.local_goal[1]
         
@@ -586,7 +607,7 @@ class Explorer:
                 remove_bool = False
                 # Remove frontiers that have already been approached
                 d1 = distance(self.total_frontiers[i], [self.odom_x, self.odom_y])
-                if self.total_frontiers[i][0] == self.local_goal[0] and self.total_frontiers[i][1] == self.local_goal[1]:
+                if self.total_frontiers[i][0] == self.frontier_goal[0] and self.total_frontiers[i][1] == self.frontier_goal[1]:
                     if d1 < 1.5:
                         remove_bool = True
                 else:
@@ -672,9 +693,330 @@ class Explorer:
                 if cost < min_cost:
                     min_cost = cost
                     local_goal = frontier
-            self.local_goal = local_goal
+            if len(local_goal) == 0:
+                return
+            self.frontier_goal = local_goal
+            self._update_observation_state()
+            self._update_uez_observation_goal()
+            self._refresh_navigation_goal()
+
+    def _update_observation_state(self):
+        if self.observation_goal is None or self.observation_goal_reached:
+            return
+        robot_pos = [self.odom_x, self.odom_y]
+        if distance(robot_pos, self.observation_goal) <= self.uez_reach_tolerance:
+            self.observation_goal_reached = True
+
+    def _refresh_navigation_goal(self):
+        if self.observation_goal is not None and not self.observation_goal_reached:
+            self.local_goal = self.observation_goal
+        else:
+            self.local_goal = self.frontier_goal
+
+    def _update_uez_observation_goal(self):
+        if not self.uez_viewpoint_enabled or self.map_msg is None or len(self.frontier_goal) == 0:
+            self._clear_observation_goal()
+            return
+
+        if not self._same_goal(self.frontier_goal, self.observation_goal_frontier):
+            self.observation_goal = None
+            self.observation_goal_frontier = list(self.frontier_goal)
+            self.observation_goal_reached = False
+            self.uez_viewpoint_info = None
+
+        if self.observation_goal_reached:
+            return
+
+        geometry = self.swp_manager.get_selected_uez_geometry(self.frontier_goal, self.map_msg)
+        if geometry is None:
+            if self.uez_fallback_to_frontier:
+                self._clear_observation_goal(keep_frontier=True)
+            return
+
+        sensor_observe_distance = self.range_max - self.uez_d_look
+        if sensor_observe_distance <= max(self.range_min, self.uez_min_view_distance):
+            self._clear_observation_goal(keep_frontier=True)
+            return
+
+        adaptive_observe_distance = self._adaptive_uez_observe_distance(
+            geometry["source_centroid"],
+            sensor_observe_distance,
+        )
+        search_rounds = [(adaptive_observe_distance, True)]
+        if adaptive_observe_distance < sensor_observe_distance - 1e-3:
+            search_rounds.append((sensor_observe_distance, False))
+
+        candidates = []
+        for observe_distance, enforce_no_backtrack in search_rounds:
+            candidates = self._collect_uez_viewpoint_candidates(
+                geometry["source_centroid"],
+                geometry["uez_centroid"],
+                observe_distance,
+                enforce_no_backtrack,
+            )
+            if candidates:
+                break
+
+        if not candidates:
+            self._clear_observation_goal(keep_frontier=True)
+            return
+
+        best = min(candidates, key=lambda item: item["score"])
+        self.observation_goal = best["point"]
+        self.uez_viewpoint_info = {
+            "source_centroid": geometry["source_centroid"],
+            "uez_centroid": geometry["uez_centroid"],
+            "observation_goal": best["point"],
+            "cluster_id": geometry["cluster_id"],
+            "path_cost": best["path_cost"],
+            "observe_distance": best["observe_distance"],
+            "no_backtrack": best["no_backtrack"],
+        }
+
+    def _clear_observation_goal(self, keep_frontier=False):
+        self.observation_goal = None
+        self.observation_goal_reached = False
+        self.uez_viewpoint_info = None
+        if not keep_frontier:
+            self.observation_goal_frontier = None
+
+    def _same_goal(self, goal_a, goal_b, tolerance=1e-3):
+        if goal_a is None or goal_b is None:
+            return False
+        return distance(goal_a, goal_b) <= tolerance
+
+    def _primary_uez_viewpoint(self, source, uez, observe_distance):
+        direction = np.array([source[0] - uez[0], source[1] - uez[1]], dtype=float)
+        norm = np.linalg.norm(direction)
+        if norm < 1e-6:
+            return None
+        direction = direction / norm
+        return [
+            source[0] + direction[0] * observe_distance,
+            source[1] + direction[1] * observe_distance,
+        ]
+
+    def _adaptive_uez_observe_distance(self, source, sensor_observe_distance):
+        robot_to_source = distance([self.odom_x, self.odom_y], source)
+        return min(
+            sensor_observe_distance,
+            max(self.uez_min_view_distance, robot_to_source + self.uez_no_backtrack_margin),
+        )
+
+    def _collect_uez_viewpoint_candidates(self, source, uez, observe_distance, enforce_no_backtrack):
+        candidates = []
+        primary = self._primary_uez_viewpoint(source, uez, observe_distance)
+        primary_score = self._evaluate_viewpoint_candidate(
+            primary,
+            source,
+            uez,
+            observe_distance,
+            enforce_no_backtrack,
+        )
+        if primary_score is not None:
+            candidates.append(primary_score)
+
+        if candidates:
+            return candidates
+
+        for sampled in self._sample_free_disk_viewpoints(source, observe_distance):
+            sampled_score = self._evaluate_viewpoint_candidate(
+                sampled,
+                source,
+                uez,
+                observe_distance,
+                enforce_no_backtrack,
+            )
+            if sampled_score is not None:
+                candidates.append(sampled_score)
+        return candidates
+
+    def _sample_free_disk_viewpoints(self, source, observe_distance):
+        source_cell = self.CoordToIndex(source)
+        radius_cells = int(math.ceil(observe_distance / self.map_resolution))
+        free_points = []
+        for dx in range(-radius_cells, radius_cells + 1):
+            for dy in range(-radius_cells, radius_cells + 1):
+                cell = (source_cell[0] + dx, source_cell[1] + dy)
+                if not self._inside_map_cell(cell):
+                    continue
+                point = self.IndexToCoord(cell)
+                if distance(point, source) > observe_distance:
+                    continue
+                if self._is_known_free_point(point, require_clearance=True):
+                    angle = math.atan2(point[1] - source[1], point[0] - source[0])
+                    radius_error = abs(observe_distance - distance(point, source))
+                    free_points.append((angle, radius_error, point))
+
+        if not free_points:
+            return []
+
+        free_points.sort(key=lambda item: (item[0], item[1]))
+        if len(free_points) <= self.uez_sample_count:
+            return [item[2] for item in free_points]
+
+        step = float(len(free_points)) / float(max(1, self.uez_sample_count))
+        samples = []
+        used = set()
+        for idx in range(self.uez_sample_count):
+            free_idx = min(int(round(idx * step)), len(free_points) - 1)
+            if free_idx in used:
+                continue
+            used.add(free_idx)
+            samples.append(free_points[free_idx][2])
+        return samples
+
+    def _evaluate_viewpoint_candidate(self, point, source, uez, observe_distance, enforce_no_backtrack):
+        if point is None:
+            return None
+        if not self._is_known_free_point(point, require_clearance=True):
+            return None
+        if not self._has_line_of_sight(point, source):
+            return None
+
+        source_distance = distance(point, source)
+        if source_distance < self.uez_min_view_distance:
+            return None
+        if enforce_no_backtrack:
+            robot_source_distance = distance([self.odom_x, self.odom_y], source)
+            if source_distance > robot_source_distance + self.uez_no_backtrack_margin:
+                return None
+
+        path_cost = self._grid_path_cost([self.odom_x, self.odom_y], point)
+        if path_cost is None:
+            return None
+
+        distance_error = abs(observe_distance - source_distance)
+        robot_distance = distance([self.odom_x, self.odom_y], point)
+        alignment_error = self._uez_alignment_error(point, source, uez)
+        score = path_cost + 0.2 * robot_distance + 0.5 * distance_error + self.uez_alignment_weight * alignment_error
+        return {
+            "point": point,
+            "path_cost": path_cost,
+            "score": score,
+            "observe_distance": observe_distance,
+            "no_backtrack": enforce_no_backtrack,
+        }
+
+    def _uez_alignment_error(self, point, source, uez):
+        desired = np.array([source[0] - uez[0], source[1] - uez[1]], dtype=float)
+        actual = np.array([point[0] - source[0], point[1] - source[1]], dtype=float)
+        desired_norm = np.linalg.norm(desired)
+        actual_norm = np.linalg.norm(actual)
+        if desired_norm < 1e-6 or actual_norm < 1e-6:
+            return 1.0
+        desired = desired / desired_norm
+        actual = actual / actual_norm
+        return 1.0 - max(-1.0, min(1.0, float(np.dot(desired, actual))))
+
+    def _grid_path_cost(self, start, goal):
+        start_cell = self.CoordToIndex(start)
+        goal_cell = self.CoordToIndex(goal)
+        if not self._is_free_cell(start_cell) or not self._is_free_cell(goal_cell):
+            return None
+
+        open_heap = [(0.0, start_cell)]
+        g_score = {start_cell: 0.0}
+        closed = set()
+        neighbors = (
+            (1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
+            (1, 1, math.sqrt(2)), (1, -1, math.sqrt(2)),
+            (-1, 1, math.sqrt(2)), (-1, -1, math.sqrt(2)),
+        )
+
+        while open_heap:
+            _f_score, current = heapq.heappop(open_heap)
+            if current in closed:
+                continue
+            if current == goal_cell:
+                return g_score[current] * self.map_resolution
+            closed.add(current)
+
+            for dx, dy, step_cost in neighbors:
+                next_cell = (current[0] + dx, current[1] + dy)
+                if next_cell in closed or not self._is_free_cell(next_cell):
+                    continue
+                tentative_g = g_score[current] + step_cost
+                if tentative_g >= g_score.get(next_cell, float("inf")):
+                    continue
+                g_score[next_cell] = tentative_g
+                heuristic = math.hypot(goal_cell[0] - next_cell[0], goal_cell[1] - next_cell[1])
+                heapq.heappush(open_heap, (tentative_g + heuristic, next_cell))
+        return None
+
+    def _has_line_of_sight(self, start, end):
+        start_cell = self.CoordToIndex(start)
+        end_cell = self.CoordToIndex(end)
+        for cell in self._bresenham_cells(start_cell, end_cell):
+            if not self._inside_map_cell(cell):
+                return False
+            if self.map_data[cell[1] * self.map_width + cell[0]] >= 10:
+                return False
+        return True
+
+    def _bresenham_cells(self, start, end):
+        x0, y0 = start
+        x1, y1 = end
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+
+        while True:
+            yield (x0, y0)
+            if x0 == x1 and y0 == y1:
+                break
+            err2 = 2 * err
+            if err2 > -dy:
+                err -= dy
+                x0 += sx
+            if err2 < dx:
+                err += dx
+                y0 += sy
+
+    def _is_known_free_point(self, point, require_clearance=False):
+        if not self._inside_map_point(point):
+            return False
+        cell = self.CoordToIndex(point)
+        if not self._is_free_cell(cell):
+            return False
+        if require_clearance:
+            return self._has_obstacle_clearance(cell)
+        return True
+
+    def _has_obstacle_clearance(self, cell):
+        radius_cells = int(math.ceil(self.uez_min_obstacle_clearance / self.map_resolution))
+        for dx in range(-radius_cells, radius_cells + 1):
+            for dy in range(-radius_cells, radius_cells + 1):
+                next_cell = (cell[0] + dx, cell[1] + dy)
+                if not self._inside_map_cell(next_cell):
+                    return False
+                if math.hypot(dx, dy) * self.map_resolution > self.uez_min_obstacle_clearance:
+                    continue
+                value = self.map_data[next_cell[1] * self.map_width + next_cell[0]]
+                if value < 0 or value >= 10:
+                    return False
+        return True
+
+    def _is_free_cell(self, cell):
+        if not self._inside_map_cell(cell):
+            return False
+        value = self.map_data[cell[1] * self.map_width + cell[0]]
+        return 0 <= value <= 10
+
+    def _inside_map_cell(self, cell):
+        return 0 <= cell[0] < self.map_width and 0 <= cell[1] < self.map_height
+
+    def _inside_map_point(self, point):
+        return (
+            self.map_origin_x <= point[0] < self.map_origin_x + self.map_width * self.map_resolution and
+            self.map_origin_y <= point[1] < self.map_origin_y + self.map_height * self.map_resolution
+        )
 
     def sendLocalGoal(self):
+        if len(self.local_goal) < 2:
+            return
         goal = MoveBaseGoal()
         goal.target_pose.header.frame_id = "map"
         goal.target_pose.header.stamp = rospy.Time.now()
@@ -787,10 +1129,89 @@ class Explorer:
         local_goal.color.g = 1.0
         local_goal.color.b = 0.0
         local_goal.pose.orientation.w = 1.0
+        if len(self.local_goal) < 2:
+            local_goal.action = local_goal.DELETE
+            self.local_goal_pub.publish(local_goal)
+            return
         local_goal.pose.position.x = self.local_goal[0]
         local_goal.pose.position.y = self.local_goal[1]
         local_goal.pose.position.z = 0.8
         self.local_goal_pub.publish(local_goal)
+
+    def pubUezViewpointMarkers(self):
+        marker_array = MarkerArray()
+        if self.uez_viewpoint_info is None:
+            clear_marker = Marker()
+            clear_marker.action = Marker.DELETEALL
+            marker_array.markers.append(clear_marker)
+            self.uez_viewpoint_pub.publish(marker_array)
+            return
+
+        stamp = rospy.Time.now()
+        marker_specs = [
+            ("uez_centroid", 0, self.uez_viewpoint_info["uez_centroid"], (0.0, 0.2, 1.0, 0.9), 0.45),
+            ("wave_source", 1, self.uez_viewpoint_info["source_centroid"], (1.0, 0.6, 0.0, 0.9), 0.4),
+            ("observation_goal", 2, self.uez_viewpoint_info["observation_goal"], (0.0, 1.0, 0.2, 0.95), 0.5),
+        ]
+
+        for namespace, marker_id, point_xy, color, scale in marker_specs:
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.header.stamp = stamp
+            marker.ns = namespace
+            marker.id = marker_id
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+            marker.pose.orientation.w = 1.0
+            marker.pose.position.x = point_xy[0]
+            marker.pose.position.y = point_xy[1]
+            marker.pose.position.z = 1.0
+            marker.scale.x = scale
+            marker.scale.y = scale
+            marker.scale.z = scale
+            marker.color.r = color[0]
+            marker.color.g = color[1]
+            marker.color.b = color[2]
+            marker.color.a = color[3]
+            marker_array.markers.append(marker)
+
+        line_marker = Marker()
+        line_marker.header.frame_id = "map"
+        line_marker.header.stamp = stamp
+        line_marker.ns = "uez_view_lines"
+        line_marker.id = 3
+        line_marker.type = Marker.LINE_LIST
+        line_marker.action = Marker.ADD
+        line_marker.pose.orientation.w = 1.0
+        line_marker.scale.x = 0.08
+        line_marker.color.r = 0.0
+        line_marker.color.g = 0.8
+        line_marker.color.b = 1.0
+        line_marker.color.a = 0.9
+        self._append_line_points(
+            line_marker,
+            self.uez_viewpoint_info["uez_centroid"],
+            self.uez_viewpoint_info["source_centroid"],
+        )
+        self._append_line_points(
+            line_marker,
+            self.uez_viewpoint_info["source_centroid"],
+            self.uez_viewpoint_info["observation_goal"],
+        )
+        marker_array.markers.append(line_marker)
+        self.uez_viewpoint_pub.publish(marker_array)
+
+    def _append_line_points(self, marker, start, end):
+        p_start = Point()
+        p_start.x = start[0]
+        p_start.y = start[1]
+        p_start.z = 1.0
+        p_end = Point()
+        p_end.x = end[0]
+        p_end.y = end[1]
+        p_end.z = 1.0
+        marker.points.append(p_start)
+        marker.points.append(p_end)
 
     def pubSubregionMarkers(self):
         # Publish marker for subregions
@@ -943,6 +1364,7 @@ class Explorer:
 
         # Publish markers for visualization
         self.pubFrontierMarkers()
+        self.pubUezViewpointMarkers()
         self.pubSubregionMarkers()
     
 def main():

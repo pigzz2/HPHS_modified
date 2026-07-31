@@ -136,6 +136,42 @@ class SWPManager:
             return self._update_all_subregions(map_msg, context)
         return self._update_selected_subregion(map_msg, context)
 
+    def get_selected_uez_geometry(self, selected_frontier, map_msg=None):
+        with self.lock:
+            context = self.context.copy() if self.context is not None else None
+            cached_map_msg = self.map_msg
+
+        map_msg = map_msg if map_msg is not None else cached_map_msg
+        if map_msg is None or context is None or selected_frontier is None:
+            return None
+
+        source_frontiers = context["selected_frontiers"] if context["selected_frontiers"] else context["frontiers"]
+        raw_clusters = self._cluster_frontiers(source_frontiers, context["frontier_cluster_dist"])
+        clusters = [cluster for cluster in raw_clusters if len(cluster) >= self.min_cluster_size]
+        if not clusters:
+            return None
+
+        target_label_id = self._selected_cluster_label(clusters, selected_frontier)
+        if target_label_id is None:
+            return None
+
+        seed_stats = self._empty_seed_stats()
+        bounds = self._subregion_bounds(map_msg, context)
+        result = self._propagate_clusters(map_msg, clusters, bounds, seed_stats, label_offset=0)
+        region_cells = result["regions"].get(target_label_id, [])
+        if not region_cells:
+            return None
+
+        source_centroid = self._points_centroid(clusters[target_label_id])
+        uez_centroid = self._cells_centroid(map_msg, region_cells)
+        return {
+            "cluster_id": target_label_id,
+            "source_centroid": source_centroid,
+            "uez_centroid": uez_centroid,
+            "region_cells": region_cells,
+            "cluster": clusters[target_label_id],
+        }
+
     def _update_selected_subregion(self, map_msg, context):
         raw_clusters = self._cluster_frontiers(
             context["selected_frontiers"] if context["selected_frontiers"] else context["frontiers"],
@@ -583,6 +619,33 @@ class SWPManager:
         point.y = (cell[1] + 0.5) * map_msg.info.resolution + map_msg.info.origin.position.y
         point.z = z
         return point
+
+    def _cell_to_xy(self, map_msg, cell):
+        return [
+            (cell[0] + 0.5) * map_msg.info.resolution + map_msg.info.origin.position.x,
+            (cell[1] + 0.5) * map_msg.info.resolution + map_msg.info.origin.position.y,
+        ]
+
+    def _points_centroid(self, points):
+        return [
+            sum(point[0] for point in points) / len(points),
+            sum(point[1] for point in points) / len(points),
+        ]
+
+    def _cells_centroid(self, map_msg, cells):
+        points = [self._cell_to_xy(map_msg, cell) for cell in cells]
+        return self._points_centroid(points)
+
+    def _selected_cluster_label(self, clusters, selected_frontier):
+        selected = [float(selected_frontier[0]), float(selected_frontier[1])]
+        best_label = None
+        best_distance = float("inf")
+        for label_id, cluster in enumerate(clusters):
+            cluster_distance = min(self._distance(selected, point) for point in cluster)
+            if cluster_distance < best_distance:
+                best_distance = cluster_distance
+                best_label = label_id
+        return best_label
 
     def _is_unknown(self, map_msg, cell):
         return self._cell_value(map_msg, cell) == -1

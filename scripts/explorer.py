@@ -101,6 +101,9 @@ class Explorer:
         self.observation_goal = None
         self.observation_goal_frontier = None
         self.observation_goal_reached = False
+        self.observation_goal_created_time = None
+        self.observation_goal_last_distance = None
+        self.observation_goal_last_progress_time = None
         self.uez_viewpoint_info = None
         self.end_exploration = False
 
@@ -114,6 +117,10 @@ class Explorer:
         self.uez_min_view_distance = float(rospy.get_param("~uez_viewpoint/min_view_distance", 1.0))
         self.uez_no_backtrack_margin = float(rospy.get_param("~uez_viewpoint/no_backtrack_margin", 0.5))
         self.uez_alignment_weight = float(rospy.get_param("~uez_viewpoint/alignment_weight", 0.3))
+        self.uez_front_cone_angle = math.radians(float(rospy.get_param("~uez_viewpoint/front_cone_angle_deg", 60.0)))
+        self.uez_front_cone_relaxed_angle = math.radians(float(rospy.get_param("~uez_viewpoint/front_cone_relaxed_angle_deg", 90.0)))
+        self.uez_replan_timeout = float(rospy.get_param("~uez_viewpoint/replan_timeout", 8.0))
+        self.uez_stuck_progress_epsilon = float(rospy.get_param("~uez_viewpoint/stuck_progress_epsilon", 0.2))
         # Publisher
         self.total_frontiers_pub = rospy.Publisher("/total_frontiers", Marker, queue_size=1)
         self.gap_frontiers_pub = rospy.Publisher("/gap_frontiers", Marker, queue_size=1)
@@ -722,9 +729,15 @@ class Explorer:
             self.observation_goal = None
             self.observation_goal_frontier = list(self.frontier_goal)
             self.observation_goal_reached = False
+            self.observation_goal_created_time = None
+            self.observation_goal_last_distance = None
+            self.observation_goal_last_progress_time = None
             self.uez_viewpoint_info = None
 
         if self.observation_goal_reached:
+            return
+
+        if self._keep_current_observation_goal():
             return
 
         geometry = self.swp_manager.get_selected_uez_geometry(self.frontier_goal, self.map_msg)
@@ -742,17 +755,24 @@ class Explorer:
             geometry["source_centroid"],
             sensor_observe_distance,
         )
-        search_rounds = [(adaptive_observe_distance, True)]
+        search_rounds = [
+            (adaptive_observe_distance, True, self.uez_front_cone_angle),
+            (adaptive_observe_distance, True, self.uez_front_cone_relaxed_angle),
+        ]
         if adaptive_observe_distance < sensor_observe_distance - 1e-3:
-            search_rounds.append((sensor_observe_distance, False))
+            search_rounds.extend([
+                (sensor_observe_distance, False, self.uez_front_cone_angle),
+                (sensor_observe_distance, False, self.uez_front_cone_relaxed_angle),
+            ])
 
         candidates = []
-        for observe_distance, enforce_no_backtrack in search_rounds:
+        for observe_distance, enforce_no_backtrack, cone_angle in search_rounds:
             candidates = self._collect_uez_viewpoint_candidates(
                 geometry["source_centroid"],
                 geometry["uez_centroid"],
                 observe_distance,
                 enforce_no_backtrack,
+                cone_angle,
             )
             if candidates:
                 break
@@ -763,6 +783,10 @@ class Explorer:
 
         best = min(candidates, key=lambda item: item["score"])
         self.observation_goal = best["point"]
+        now = rospy.Time.now().to_sec()
+        self.observation_goal_created_time = now
+        self.observation_goal_last_progress_time = now
+        self.observation_goal_last_distance = distance([self.odom_x, self.odom_y], self.observation_goal)
         self.uez_viewpoint_info = {
             "source_centroid": geometry["source_centroid"],
             "uez_centroid": geometry["uez_centroid"],
@@ -771,14 +795,45 @@ class Explorer:
             "path_cost": best["path_cost"],
             "observe_distance": best["observe_distance"],
             "no_backtrack": best["no_backtrack"],
+            "cone_angle": best["cone_angle"],
         }
 
     def _clear_observation_goal(self, keep_frontier=False):
         self.observation_goal = None
         self.observation_goal_reached = False
+        self.observation_goal_created_time = None
+        self.observation_goal_last_distance = None
+        self.observation_goal_last_progress_time = None
         self.uez_viewpoint_info = None
         if not keep_frontier:
             self.observation_goal_frontier = None
+
+    def _keep_current_observation_goal(self):
+        if self.observation_goal is None:
+            return False
+        if not self._is_known_free_point(self.observation_goal, require_clearance=True):
+            return False
+
+        now = rospy.Time.now().to_sec()
+        current_distance = distance([self.odom_x, self.odom_y], self.observation_goal)
+        if self.observation_goal_last_distance is None:
+            self.observation_goal_last_distance = current_distance
+            self.observation_goal_last_progress_time = now
+            return True
+
+        progress = self.observation_goal_last_distance - current_distance
+        if progress >= self.uez_stuck_progress_epsilon:
+            self.observation_goal_last_distance = current_distance
+            self.observation_goal_last_progress_time = now
+            return True
+
+        if self.observation_goal_last_progress_time is None:
+            self.observation_goal_last_progress_time = now
+            return True
+
+        if now - self.observation_goal_last_progress_time >= self.uez_replan_timeout:
+            return False
+        return True
 
     def _same_goal(self, goal_a, goal_b, tolerance=1e-3):
         if goal_a is None or goal_b is None:
@@ -803,7 +858,7 @@ class Explorer:
             max(self.uez_min_view_distance, robot_to_source + self.uez_no_backtrack_margin),
         )
 
-    def _collect_uez_viewpoint_candidates(self, source, uez, observe_distance, enforce_no_backtrack):
+    def _collect_uez_viewpoint_candidates(self, source, uez, observe_distance, enforce_no_backtrack, cone_angle):
         candidates = []
         primary = self._primary_uez_viewpoint(source, uez, observe_distance)
         primary_score = self._evaluate_viewpoint_candidate(
@@ -812,6 +867,7 @@ class Explorer:
             uez,
             observe_distance,
             enforce_no_backtrack,
+            cone_angle,
         )
         if primary_score is not None:
             candidates.append(primary_score)
@@ -819,21 +875,26 @@ class Explorer:
         if candidates:
             return candidates
 
-        for sampled in self._sample_free_disk_viewpoints(source, observe_distance):
+        for sampled in self._sample_front_cone_viewpoints(source, uez, observe_distance, cone_angle):
             sampled_score = self._evaluate_viewpoint_candidate(
                 sampled,
                 source,
                 uez,
                 observe_distance,
                 enforce_no_backtrack,
+                cone_angle,
             )
             if sampled_score is not None:
                 candidates.append(sampled_score)
         return candidates
 
-    def _sample_free_disk_viewpoints(self, source, observe_distance):
+    def _sample_front_cone_viewpoints(self, source, uez, observe_distance, cone_angle):
         source_cell = self.CoordToIndex(source)
         radius_cells = int(math.ceil(observe_distance / self.map_resolution))
+        front_direction = self._uez_front_direction(source, uez)
+        if front_direction is None:
+            return []
+
         free_points = []
         for dx in range(-radius_cells, radius_cells + 1):
             for dy in range(-radius_cells, radius_cells + 1):
@@ -842,6 +903,8 @@ class Explorer:
                     continue
                 point = self.IndexToCoord(cell)
                 if distance(point, source) > observe_distance:
+                    continue
+                if not self._inside_front_cone(point, source, front_direction, cone_angle):
                     continue
                 if self._is_known_free_point(point, require_clearance=True):
                     angle = math.atan2(point[1] - source[1], point[0] - source[0])
@@ -866,12 +929,15 @@ class Explorer:
             samples.append(free_points[free_idx][2])
         return samples
 
-    def _evaluate_viewpoint_candidate(self, point, source, uez, observe_distance, enforce_no_backtrack):
+    def _evaluate_viewpoint_candidate(self, point, source, uez, observe_distance, enforce_no_backtrack, cone_angle):
         if point is None:
             return None
         if not self._is_known_free_point(point, require_clearance=True):
             return None
         if not self._has_line_of_sight(point, source):
+            return None
+        front_direction = self._uez_front_direction(source, uez)
+        if front_direction is None or not self._inside_front_cone(point, source, front_direction, cone_angle):
             return None
 
         source_distance = distance(point, source)
@@ -896,6 +962,7 @@ class Explorer:
             "score": score,
             "observe_distance": observe_distance,
             "no_backtrack": enforce_no_backtrack,
+            "cone_angle": cone_angle,
         }
 
     def _uez_alignment_error(self, point, source, uez):
@@ -908,6 +975,21 @@ class Explorer:
         desired = desired / desired_norm
         actual = actual / actual_norm
         return 1.0 - max(-1.0, min(1.0, float(np.dot(desired, actual))))
+
+    def _uez_front_direction(self, source, uez):
+        direction = np.array([source[0] - uez[0], source[1] - uez[1]], dtype=float)
+        norm = np.linalg.norm(direction)
+        if norm < 1e-6:
+            return None
+        return direction / norm
+
+    def _inside_front_cone(self, point, source, front_direction, cone_angle):
+        vector = np.array([point[0] - source[0], point[1] - source[1]], dtype=float)
+        norm = np.linalg.norm(vector)
+        if norm < 1e-6:
+            return False
+        vector = vector / norm
+        return float(np.dot(vector, front_direction)) >= math.cos(cone_angle)
 
     def _grid_path_cost(self, start, goal):
         start_cell = self.CoordToIndex(start)
